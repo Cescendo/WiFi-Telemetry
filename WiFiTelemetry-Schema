@@ -1,0 +1,39 @@
+IF OBJECT_ID('dbo.WiFiTelemetrySamples', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.WiFiTelemetrySamples
+    (
+        Id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        [Timestamp] DATETIME2(0) NOT NULL,
+        Computer NVARCHAR(128) NULL,
+        UserPrincipal NVARCHAR(256) NULL,
+        Interface NVARCHAR(128) NULL,
+        [State] NVARCHAR(64) NULL,
+        SSID NVARCHAR(256) NULL,
+        BSSID NVARCHAR(64) NULL,
+        Radio NVARCHAR(64) NULL,
+        Channel INT NULL,
+        SignalPercent INT NULL,
+        SignalDbm INT NULL,
+        Gateway NVARCHAR(64) NULL,
+        GatewayPingMs INT NULL,
+        InternetHost NVARCHAR(256) NULL,
+        InternetPingMs INT NULL,
+        InternalHost1 NVARCHAR(256) NULL,
+        InternalHost1PingMs INT NULL,
+        InternalHost2 NVARCHAR(256) NULL,
+        InternalHost2PingMs INT NULL,
+        SourceFile NVARCHAR(260) NULL,
+        InsertedAtUtc DATETIME2(0) NOT NULL CONSTRAINT DF_WiFiTelemetrySamples_InsertedAtUtc DEFAULT (SYSUTCDATETIME())
+    );
+END;
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'IX_WiFiTelemetrySamples_Timestamp_Computer'
+    AND object_id = OBJECT_ID('dbo.WiFiTelemetrySamples')
+)
+BEGIN
+    CREATE INDEX IX_WiFiTelemetrySamples_Timestamp_Computer
+        ON dbo.WiFiTelemetrySamples ([Timestamp], Computer);
+END;
