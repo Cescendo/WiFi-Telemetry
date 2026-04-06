@@ -1,0 +1,297 @@
+param(
+    [string]$SqlServer = "sql01.example.local",
+
+    [Parameter(Mandatory = $true)]
+    [string]$Database,
+
+    [string]$TableName = "",
+    [string]$SourceDir = "\\fileserver.example.local\Public\WiFiTelemetry",
+    [string]$ArchiveDir = "\\fileserver.example.local\Public\WiFiTelemetry\Archive",
+    [string]$FilePattern = "wifi_telemetry_*.csv",
+    [bool]$UseTrustedConnection = $false,
+    [string]$SqlUser = "",
+    [string]$SqlPassword = "",
+    [PSCredential]$SqlCredential
+)
+
+$ErrorActionPreference = "Stop"
+
+if (-not (Test-Path $SourceDir)) {
+    throw "Source directory not found: $SourceDir"
+}
+if (-not (Test-Path $ArchiveDir)) {
+    New-Item -Path $ArchiveDir -ItemType Directory -Force | Out-Null
+}
+
+if (-not $UseTrustedConnection -and -not $SqlCredential) {
+    if (-not [string]::IsNullOrWhiteSpace($SqlPassword)) {
+        $securePass = ConvertTo-SecureString $SqlPassword -AsPlainText -Force
+        $SqlCredential = New-Object System.Management.Automation.PSCredential($SqlUser.Trim(), $securePass)
+    } else {
+        $SqlCredential = Get-Credential -UserName $SqlUser -Message "Enter SQL credentials for $SqlServer"
+    }
+}
+
+function New-SqlConnection([string]$Server, [string]$Db, [bool]$Trusted, [PSCredential]$Credential) {
+    $connectionStringBuilder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+    $connectionStringBuilder["Data Source"] = $Server
+    $connectionStringBuilder["Initial Catalog"] = $Db
+    $connectionStringBuilder["Connect Timeout"] = 30
+
+    if ($Trusted) {
+        $connectionStringBuilder["Integrated Security"] = $true
+    } else {
+        if (-not $Credential) {
+            throw "SqlCredential is required when UseTrustedConnection is disabled."
+        }
+
+        $connectionStringBuilder["Integrated Security"] = $false
+        $connectionStringBuilder["User ID"] = $Credential.UserName
+        $connectionStringBuilder["Password"] = $Credential.GetNetworkCredential().Password
+    }
+
+    return New-Object System.Data.SqlClient.SqlConnection($connectionStringBuilder.ConnectionString)
+}
+
+function Split-TableName([string]$QualifiedName) {
+    $parts = $QualifiedName.Split(".", 2)
+    if ($parts.Count -eq 2) {
+        return [PSCustomObject]@{ Schema = $parts[0]; Name = $parts[1] }
+    }
+
+    return [PSCustomObject]@{ Schema = "dbo"; Name = $QualifiedName }
+}
+
+function Get-DestinationColumnSet([System.Data.SqlClient.SqlConnection]$Connection, [string]$QualifiedTableName) {
+    $table = Split-TableName -QualifiedName $QualifiedTableName
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText = @"
+SELECT COLUMN_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = @schema
+  AND TABLE_NAME = @table
+"@
+    [void]$cmd.Parameters.Add("@schema", [System.Data.SqlDbType]::NVarChar, 128)
+    [void]$cmd.Parameters.Add("@table", [System.Data.SqlDbType]::NVarChar, 128)
+    $cmd.Parameters["@schema"].Value = $table.Schema
+    $cmd.Parameters["@table"].Value = $table.Name
+
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $reader = $cmd.ExecuteReader()
+    try {
+        while ($reader.Read()) {
+            [void]$set.Add([string]$reader.GetString(0))
+        }
+    } finally {
+        $reader.Close()
+    }
+
+    return $set
+}
+
+function Test-SqlConnection([string]$Server, [string]$Db, [bool]$Trusted, [PSCredential]$Credential) {
+    $conn = $null
+    try {
+        $conn = New-SqlConnection -Server $Server -Db $Db -Trusted $Trusted -Credential $Credential
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT 1"
+        [void]$cmd.ExecuteScalar()
+        return $true
+    } finally {
+        if ($conn) { $conn.Close() }
+    }
+}
+
+function Convert-ToNullIfEmpty([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return [DBNull]::Value }
+    return $Value
+}
+
+function Convert-UserToNull([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return [DBNull]::Value }
+    if ($Value.Trim().Equals("NoUserLoggedOn", [System.StringComparison]::OrdinalIgnoreCase)) { return [DBNull]::Value }
+    return $Value
+}
+
+function Convert-ToNullableInt([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return [DBNull]::Value }
+    $parsed = 0
+    if ([int]::TryParse($Value, [ref]$parsed)) {
+        return $parsed
+    }
+    return [DBNull]::Value
+}
+
+function Convert-ChannelToNullableInt([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return [DBNull]::Value }
+
+    $raw = $Value.Trim()
+    $parsed = 0
+    if ([int]::TryParse($raw, [ref]$parsed)) {
+        return $parsed
+    }
+
+    $match = [regex]::Match($raw, '\d+')
+    if ($match.Success -and [int]::TryParse($match.Value, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return [DBNull]::Value
+}
+
+function Import-CsvToSql([string]$CsvPath, [string]$Server, [string]$Db, [string]$DestinationTable, [bool]$Trusted, [PSCredential]$Credential) {
+    $rows = Import-Csv -Path $CsvPath
+    if (-not $rows -or $rows.Count -eq 0) {
+        return 0
+    }
+
+    $dataTable = New-Object System.Data.DataTable
+    [void]$dataTable.Columns.Add("Timestamp", [datetime])
+    [void]$dataTable.Columns.Add("Computer", [string])
+    [void]$dataTable.Columns.Add("UserPrincipal", [string])
+    [void]$dataTable.Columns.Add("Interface", [string])
+    [void]$dataTable.Columns.Add("State", [string])
+    [void]$dataTable.Columns.Add("SSID", [string])
+    [void]$dataTable.Columns.Add("BSSID", [string])
+    [void]$dataTable.Columns.Add("Radio", [string])
+    [void]$dataTable.Columns.Add("Channel", [int])
+    [void]$dataTable.Columns.Add("SignalPercent", [int])
+    [void]$dataTable.Columns.Add("SignalDbm", [int])
+    [void]$dataTable.Columns.Add("Gateway", [string])
+    [void]$dataTable.Columns.Add("GatewayPingMs", [int])
+    [void]$dataTable.Columns.Add("InternetHost", [string])
+    [void]$dataTable.Columns.Add("InternetPingMs", [int])
+    [void]$dataTable.Columns.Add("InternalHost1", [string])
+    [void]$dataTable.Columns.Add("InternalHost1PingMs", [int])
+    [void]$dataTable.Columns.Add("InternalHost2", [string])
+    [void]$dataTable.Columns.Add("InternalHost2PingMs", [int])
+    [void]$dataTable.Columns.Add("SourceFile", [string])
+
+    foreach ($row in $rows) {
+        $userValue = [string]$row.User
+        $hasLoggedOnUser = (-not [string]::IsNullOrWhiteSpace($userValue)) -and (-not $userValue.Trim().Equals("NoUserLoggedOn", [System.StringComparison]::OrdinalIgnoreCase)) -and (-not $userValue.Trim().Equals("Unknown", [System.StringComparison]::OrdinalIgnoreCase))
+        if (-not $hasLoggedOnUser) {
+            continue
+        }
+
+        $dataRow = $dataTable.NewRow()
+        $dataRow["Timestamp"] = [datetime]::ParseExact($row.Timestamp, "yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+        $dataRow["Computer"] = Convert-ToNullIfEmpty $row.Computer
+        $dataRow["UserPrincipal"] = Convert-UserToNull $row.User
+        $dataRow["Interface"] = Convert-ToNullIfEmpty $row.Interface
+        $dataRow["State"] = Convert-ToNullIfEmpty $row.State
+        $dataRow["SSID"] = Convert-ToNullIfEmpty $row.SSID
+        $dataRow["BSSID"] = Convert-ToNullIfEmpty $row.BSSID
+        $dataRow["Radio"] = Convert-ToNullIfEmpty $row.Radio
+        $dataRow["Channel"] = Convert-ChannelToNullableInt $row.Channel
+        $dataRow["SignalPercent"] = Convert-ToNullableInt $row.SignalPercent
+        $dataRow["SignalDbm"] = Convert-ToNullableInt $row.SignalDbm
+        $dataRow["Gateway"] = Convert-ToNullIfEmpty $row.Gateway
+        $dataRow["GatewayPingMs"] = Convert-ToNullableInt $row.GatewayPingMs
+        $dataRow["InternetHost"] = Convert-ToNullIfEmpty $row.InternetHost
+        $dataRow["InternetPingMs"] = Convert-ToNullableInt $row.InternetPingMs
+        $dataRow["InternalHost1"] = Convert-ToNullIfEmpty $row.InternalHost1
+        $dataRow["InternalHost1PingMs"] = Convert-ToNullableInt $row.InternalHost1PingMs
+        $dataRow["InternalHost2"] = Convert-ToNullIfEmpty $row.InternalHost2
+        $dataRow["InternalHost2PingMs"] = Convert-ToNullableInt $row.InternalHost2PingMs
+        $dataRow["SourceFile"] = [System.IO.Path]::GetFileName($CsvPath)
+        [void]$dataTable.Rows.Add($dataRow)
+    }
+
+    if ($dataTable.Rows.Count -eq 0) {
+        return 0
+    }
+
+    $connection = $null
+    $bulkCopy = $null
+
+    try {
+        $connection = New-SqlConnection -Server $Server -Db $Db -Trusted $Trusted -Credential $Credential
+        $connection.Open()
+
+        $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy($connection)
+        $bulkCopy.DestinationTableName = $DestinationTable
+        $bulkCopy.BatchSize = 1000
+        $bulkCopy.BulkCopyTimeout = 120
+
+        $destinationColumns = Get-DestinationColumnSet -Connection $connection -QualifiedTableName $DestinationTable
+        if ($destinationColumns.Count -eq 0) {
+            throw "Destination table '$DestinationTable' was not found or has no columns."
+        }
+
+        $mappedCount = 0
+        foreach ($col in $dataTable.Columns.ColumnName) {
+            if ($destinationColumns.Contains($col)) {
+                [void]$bulkCopy.ColumnMappings.Add($col, $col)
+                $mappedCount++
+            }
+        }
+
+        if ($mappedCount -eq 0) {
+            throw "No matching columns found between CSV data and destination table '$DestinationTable'."
+        }
+
+        $bulkCopy.WriteToServer($dataTable)
+        return $dataTable.Rows.Count
+    }
+    finally {
+        if ($bulkCopy) { $bulkCopy.Close() }
+        if ($connection) { $connection.Close() }
+    }
+}
+
+$allCsvFiles = Get-ChildItem -Path $SourceDir -Filter $FilePattern -File
+$currentHour = (Get-Date).ToString("yyyyMMdd_HH")
+
+$eligibleFiles = $allCsvFiles | Where-Object {
+    $_.BaseName -match '_(\d{8}_\d{2})$' -and $Matches[1] -lt $currentHour
+} | Sort-Object LastWriteTime
+
+if (-not $eligibleFiles -or $eligibleFiles.Count -eq 0) {
+    Write-Host "No completed hourly files to import."
+    exit 0
+}
+
+$trusted = [bool]$UseTrustedConnection
+$importedFiles = 0
+$importedRows = 0
+
+$effectiveSqlUser = if ($trusted) { "<IntegratedSecurity>" } else { $SqlCredential.UserName }
+$authMode = if ($trusted) { "Integrated" } else { "SQL" }
+Write-Host "SQL target: server='$SqlServer' database='$Database' table='$TableName' auth='$authMode' user='$effectiveSqlUser'"
+
+try {
+    [void](Test-SqlConnection -Server $SqlServer -Db $Database -Trusted $trusted -Credential $SqlCredential)
+    Write-Host "SQL connectivity test: OK"
+}
+catch [System.Data.SqlClient.SqlException] {
+    $sqlEx = $_.Exception
+    Write-Error "SQL connectivity test failed. Number=$($sqlEx.Number) State=$($sqlEx.State) Class=$($sqlEx.Class) Message=$($sqlEx.Message)"
+    exit 1
+}
+catch {
+    Write-Error "SQL connectivity test failed: $($_.Exception.Message)"
+    exit 1
+}
+
+foreach ($file in $eligibleFiles) {
+    try {
+        $rowCount = Import-CsvToSql -CsvPath $file.FullName -Server $SqlServer -Db $Database -DestinationTable $TableName -Trusted $trusted -Credential $SqlCredential
+        $archivePath = Join-Path $ArchiveDir $file.Name
+        Move-Item -Path $file.FullName -Destination $archivePath -Force
+        $importedFiles++
+        $importedRows += $rowCount
+        Write-Host "Imported and archived: $($file.Name) ($rowCount rows)"
+    }
+    catch {
+        if ($_.Exception -is [System.Data.SqlClient.SqlException]) {
+            $sqlEx = [System.Data.SqlClient.SqlException]$_.Exception
+            Write-Warning "Failed to import $($file.Name): SQL Number=$($sqlEx.Number) State=$($sqlEx.State) Class=$($sqlEx.Class) Message=$($sqlEx.Message)"
+        } else {
+            Write-Warning "Failed to import $($file.Name): $($_.Exception.Message)"
+        }
+    }
+}
+
+Write-Host "Import complete. Files imported: $importedFiles. Rows imported: $importedRows."
