@@ -1,0 +1,846 @@
+<#
+WiFi-Telemetry_ANON.ps1
+Logs Wi-Fi quality + latency to hourly CSV files.
+Default paths and hostnames are anonymized placeholders for public sharing.
+#>
+
+param(
+    [int]$IntervalSeconds = 10,
+    [int]$SyncIntervalMinutes = 5,
+    [int]$SyncBacklogHours = 168,
+    [int]$LocalRetentionDays = 7,
+    [string]$OutputDir = "\\fileserver.example.local\Public\WiFiTelemetry",
+    [string]$LocalOutputDir = "C:\Users\Public\WiFiTelemetry",
+    [string]$InternetHost = "8.8.8.8",
+    [string]$InternalHost1 = "dc01.example.local",
+    [string]$InternalHost2 = "app01.example.local",
+    [string]$ExpectedSSID = "Corp-WiFi",
+    [string]$ComputerName = $env:COMPUTERNAME,
+    [PSCredential]$Credential,
+    [switch]$InstallStartupTask,
+    [switch]$RemoveStartupTask,
+    [string]$StartupTaskName = "WiFi-Telemetry",
+    [string]$LocalScriptPath = "C:\Windows\System32\config\systemprofile\WiFi-Telemetry\WiFi-Telemetry_ANON.ps1"
+)
+
+$ErrorActionPreference = "Stop"
+$csvHeader = "Timestamp,Computer,User,Interface,State,SSID,BSSID,Radio,Channel,SignalPercent,SignalDbm,Gateway,GatewayPingMs,InternetHost,InternetPingMs,InternalHost1,InternalHost1PingMs,InternalHost2,InternalHost2PingMs"
+
+function Test-IsAdministrator {
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Quote-TaskArgument([string]$Value) {
+    if ($null -eq $Value) { return '""' }
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Install-LocalScriptCopy([string]$SourcePath, [string]$DestinationPath) {
+    if ([string]::IsNullOrWhiteSpace($SourcePath) -or -not (Test-Path $SourcePath)) {
+        throw "Unable to copy script. Source path '$SourcePath' was not found."
+    }
+    if ([string]::IsNullOrWhiteSpace($DestinationPath)) {
+        throw "Unable to copy script. Local script path is empty."
+    }
+
+    $destinationDir = Split-Path -Path $DestinationPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($destinationDir)) {
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+    }
+
+    Copy-Item -Path $SourcePath -Destination $DestinationPath -Force
+    return $DestinationPath
+}
+
+function Stop-RunningMonitorProcesses([int]$ExcludePid = 0) {
+    try {
+        $candidates = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue
+        foreach ($proc in $candidates) {
+            if (-not $proc -or $proc.ProcessId -eq $PID) {
+                continue
+            }
+            if ($ExcludePid -gt 0 -and $proc.ProcessId -eq $ExcludePid) {
+                continue
+            }
+
+            $cmd = [string]$proc.CommandLine
+            if ([string]::IsNullOrWhiteSpace($cmd)) {
+                continue
+            }
+            if ($cmd -notmatch 'WiFi-(Monitor|Telemetry_ANON)\.ps1') {
+                continue
+            }
+
+            try {
+                Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+                Start-Sleep -Milliseconds 300
+                Write-Host "Stopped existing WiFi telemetry process (PID $($proc.ProcessId))."
+            } catch {
+                Write-Warning "Could not stop existing WiFi telemetry process (PID $($proc.ProcessId)): $($_.Exception.Message)"
+            }
+        }
+    } catch {}
+}
+
+function Install-StartupScheduledTask {
+    if (-not (Test-IsAdministrator)) {
+        throw "Installing the startup task requires an elevated PowerShell session."
+    }
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        throw "Unable to resolve script path. Run this script from file when installing the startup task."
+    }
+    $existingTask = Get-ScheduledTask -TaskName $StartupTaskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        Write-Host "Startup scheduled task '$StartupTaskName' already exists. Skipping install."
+        return
+    }
+    if ($Credential) {
+        Write-Warning "Credential parameter is not persisted in the startup task and will be ignored."
+    }
+    $taskScriptPath = Install-LocalScriptCopy -SourcePath $PSCommandPath -DestinationPath $LocalScriptPath
+
+    $taskArgs = @(
+        "-NoProfile"
+        "-ExecutionPolicy Bypass"
+        "-WindowStyle Hidden"
+        "-File $(Quote-TaskArgument -Value $taskScriptPath)"
+        "-IntervalSeconds $IntervalSeconds"
+        "-SyncIntervalMinutes $SyncIntervalMinutes"
+        "-SyncBacklogHours $SyncBacklogHours"
+        "-LocalRetentionDays $LocalRetentionDays"
+        "-OutputDir $(Quote-TaskArgument -Value $OutputDir)"
+        "-LocalOutputDir $(Quote-TaskArgument -Value $LocalOutputDir)"
+        "-InternetHost $(Quote-TaskArgument -Value $InternetHost)"
+        "-InternalHost1 $(Quote-TaskArgument -Value $InternalHost1)"
+        "-InternalHost2 $(Quote-TaskArgument -Value $InternalHost2)"
+        "-ExpectedSSID $(Quote-TaskArgument -Value $ExpectedSSID)"
+        "-ComputerName $(Quote-TaskArgument -Value $ComputerName)"
+    ) -join " "
+
+    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $taskArgs
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+
+    Register-ScheduledTask -TaskName $StartupTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Host "Installed startup scheduled task '$StartupTaskName'."
+    Write-Host "Local script copy: $taskScriptPath"
+}
+
+function Ensure-RunningFromLocalScript {
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($LocalScriptPath)) {
+        return
+    }
+
+    $currentFullPath = [System.IO.Path]::GetFullPath($PSCommandPath)
+    $targetFullPath = [System.IO.Path]::GetFullPath($LocalScriptPath)
+    if ($currentFullPath -ieq $targetFullPath) {
+        return
+    }
+
+    # Ensure old monitor instances do not hold stale code while we copy/relaunch.
+    Stop-RunningMonitorProcesses
+
+    try {
+        $copiedPath = Install-LocalScriptCopy -SourcePath $PSCommandPath -DestinationPath $LocalScriptPath
+    } catch {
+        Write-Warning "Could not copy script to local path '$LocalScriptPath': $($_.Exception.Message)"
+        return
+    }
+
+    $relaunchArgs = @(
+        "-NoProfile"
+        "-ExecutionPolicy"
+        "Bypass"
+        "-File"
+        $copiedPath
+        "-LocalScriptPath"
+        $copiedPath
+    )
+
+    foreach ($entry in $PSBoundParameters.GetEnumerator()) {
+        $key = $entry.Key
+        $value = $entry.Value
+        if ($key -eq "LocalScriptPath") {
+            continue
+        }
+        if ($null -eq $value) {
+            continue
+        }
+
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) {
+                $relaunchArgs += "-$key"
+            }
+            continue
+        }
+
+        $relaunchArgs += "-$key"
+        $relaunchArgs += [string]$value
+    }
+
+    Write-Host "Copied script to local path: $copiedPath"
+    Write-Host "Restarting from local copy."
+    try {
+        $localProc = Start-Process -FilePath "PowerShell.exe" -ArgumentList $relaunchArgs -WindowStyle Hidden -PassThru
+    } catch {
+        Write-Warning "Failed to start local copy. Continuing with current instance: $($_.Exception.Message)"
+        return
+    }
+
+    $handoffDeadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $handoffDeadline) {
+        Start-Sleep -Milliseconds 500
+        $runningProc = Get-Process -Id $localProc.Id -ErrorAction SilentlyContinue
+        if ($runningProc) {
+            Write-Host "Handoff complete. Local instance PID: $($localProc.Id)"
+            exit
+        }
+    }
+
+    Write-Warning "Local handoff process exited early. Continuing with current instance."
+}
+
+function Remove-StartupScheduledTask {
+    if (-not (Test-IsAdministrator)) {
+        throw "Removing the startup task requires an elevated PowerShell session."
+    }
+
+    $existingTask = Get-ScheduledTask -TaskName $StartupTaskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        Unregister-ScheduledTask -TaskName $StartupTaskName -Confirm:$false
+        Write-Host "Removed startup scheduled task '$StartupTaskName'."
+    } else {
+        Write-Host "Startup scheduled task '$StartupTaskName' was not found."
+    }
+}
+
+if ($InstallStartupTask -and $RemoveStartupTask) {
+    throw "Use either -InstallStartupTask or -RemoveStartupTask, not both."
+}
+if ($InstallStartupTask) {
+    Install-StartupScheduledTask
+    return
+}
+if ($RemoveStartupTask) {
+    Remove-StartupScheduledTask
+    return
+}
+Ensure-RunningFromLocalScript
+
+function Ensure-LocationServicesEnabled {
+    # Best-effort: enable geolocation service and policy required by WLAN queries.
+    try {
+        $lfsvc = Get-Service -Name "lfsvc" -ErrorAction SilentlyContinue
+        if ($lfsvc) {
+            if ($lfsvc.StartType -eq "Disabled") {
+                Set-Service -Name "lfsvc" -StartupType Manual -ErrorAction SilentlyContinue
+            }
+            if ($lfsvc.Status -ne "Running") {
+                Start-Service -Name "lfsvc" -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+
+    try {
+        $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors"
+        New-Item -Path $policyPath -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-ItemProperty -Path $policyPath -Name "DisableLocation" -Type DWord -Value 0 -ErrorAction SilentlyContinue
+    } catch {}
+
+    try {
+        $consentPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+        New-Item -Path $consentPath -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-ItemProperty -Path $consentPath -Name "Value" -Type String -Value "Allow" -ErrorAction SilentlyContinue
+    } catch {}
+
+    try {
+        $userConsentPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+        New-Item -Path $userConsentPath -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-ItemProperty -Path $userConsentPath -Name "Value" -Type String -Value "Allow" -ErrorAction SilentlyContinue
+    } catch {}
+
+    try {
+        $adminFlowExe = "$env:WINDIR\system32\SystemSettingsAdminFlows.exe"
+        if (Test-Path $adminFlowExe) {
+            & $adminFlowExe SetCamSystemGlobal location 1 | Out-Null
+        }
+    } catch {}
+}
+
+function Test-WlanAccessBlocked {
+    try {
+        $out = netsh wlan show interfaces 2>&1 | Out-String
+        if ($out -match "Function WlanQueryInterface returns error 5" -or
+            $out -match "Access is denied" -or
+            $out -match "need location permission") {
+            return $true
+        }
+    } catch {}
+    return $false
+}
+
+
+function Get-SafeComputerName([string]$InputComputerName) {
+    $nameToUse = $InputComputerName
+    if ($nameToUse -eq "." -or $nameToUse -eq "localhost" -or $nameToUse -ieq $env:COMPUTERNAME) {
+        $nameToUse = $env:COMPUTERNAME
+    }
+
+    $safeName = ($nameToUse -replace '[\\/:*?"<>|]', '_').Trim()
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        return "unknown-computer"
+    }
+
+    return $safeName
+}
+
+function Read-LockPid([string]$LockFilePath) {
+    if (-not (Test-Path $LockFilePath)) {
+        return $null
+    }
+
+    try {
+        $raw = Get-Content -Path $LockFilePath -Raw -ErrorAction Stop
+        $parsed = 0
+        if ([int]::TryParse($raw.Trim(), [ref]$parsed)) {
+            return $parsed
+        }
+    } catch {}
+
+    return $null
+}
+
+function Get-MonitorProcessInfo([int]$ProcessIdToCheck) {
+    try {
+        return Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessIdToCheck" -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Stop-PreviousInstanceIfNeeded([string]$LockFilePath) {
+    $existingPid = Read-LockPid -LockFilePath $LockFilePath
+    if (-not $existingPid -or $existingPid -eq $PID) {
+        return
+    }
+
+    $procInfo = Get-MonitorProcessInfo -ProcessIdToCheck $existingPid
+    if (-not $procInfo) {
+        return
+    }
+
+    $isPwsh = $procInfo.Name -match '^powershell(\.exe)?$|^pwsh(\.exe)?$'
+    $isMonitor = $procInfo.CommandLine -match 'WiFi-(Monitor|Telemetry_ANON)\.ps1'
+    if ($isPwsh -and $isMonitor) {
+        try {
+            Stop-Process -Id $existingPid -Force -ErrorAction Stop
+            Start-Sleep -Seconds 1
+            Write-Host "Stopped previous WiFi telemetry instance (PID $existingPid)."
+        } catch {
+            Write-Warning "Could not stop previous WiFi telemetry instance (PID $existingPid): $($_.Exception.Message)"
+        }
+    }
+}
+
+function Ensure-CsvFile([string]$FilePath) {
+    if (-not (Test-Path $FilePath)) {
+        $csvHeader | Out-File -FilePath $FilePath -Encoding utf8
+    }
+}
+
+function Try-EnsureNetworkCsvFile([string]$FilePath) {
+    try {
+        Ensure-CsvFile -FilePath $FilePath
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Try-AppendNetworkRow([string]$FilePath, [string]$Row) {
+    try {
+        Add-Content -Path $FilePath -Value $Row
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Sync-LocalCsvToNetwork([string]$BaseLocalDir, [string]$BaseNetworkDir, [string]$CurrentHourStamp, [string]$SyncStartHourStamp) {
+    try {
+        if (-not (Test-Path $BaseNetworkDir)) {
+            return
+        }
+
+        $localFiles = Get-ChildItem -Path $BaseLocalDir -Filter "wifi_telemetry_*.csv" -File -ErrorAction SilentlyContinue
+        foreach ($localFile in $localFiles) {
+            $fileHour = ""
+            if ($localFile.BaseName -match '_(\d{8}_\d{2})$') {
+                $fileHour = $Matches[1]
+            }
+
+            # Sync backlog within a bounded window (default 7 days) to recover outages.
+            $isSyncWindowFile = (-not [string]::IsNullOrWhiteSpace($fileHour)) -and ($fileHour -ge $SyncStartHourStamp) -and ($fileHour -le $CurrentHourStamp)
+            if (-not $isSyncWindowFile) {
+                continue
+            }
+
+            $networkFilePath = Join-Path $BaseNetworkDir $localFile.Name
+            $needsCopy = $false
+
+            if (-not (Test-Path $networkFilePath)) {
+                $needsCopy = $true
+            } else {
+                $networkFile = Get-Item -Path $networkFilePath -ErrorAction SilentlyContinue
+                if (-not $networkFile -or $networkFile.Length -ne $localFile.Length -or $networkFile.LastWriteTimeUtc -lt $localFile.LastWriteTimeUtc) {
+                    $needsCopy = $true
+                }
+            }
+
+            if ($needsCopy) {
+                Copy-Item -Path $localFile.FullName -Destination $networkFilePath -Force
+            }
+
+            if ($fileHour -lt $CurrentHourStamp -and (Test-Path $networkFilePath)) {
+                Remove-Item -Path $localFile.FullName -Force
+            }
+        }
+
+        $retentionCutoff = (Get-Date).AddDays(-$LocalRetentionDays)
+        $staleLocalFiles = Get-ChildItem -Path $BaseLocalDir -Filter "wifi_telemetry_*.csv" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $retentionCutoff }
+        foreach ($staleFile in $staleLocalFiles) {
+            Remove-Item -Path $staleFile.FullName -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # Best-effort sync; ignore transient network issues.
+    }
+}
+
+function Get-CsvPathsForHour([string]$BaseOutputDir, [string]$BaseLocalOutputDir, [string]$SafeComputerName, [datetime]$Now) {
+    $hourStamp = $Now.ToString("yyyyMMdd_HH")
+    $fileName = "wifi_telemetry_${SafeComputerName}_${hourStamp}.csv"
+
+    return [PSCustomObject]@{
+        HourStamp    = $hourStamp
+        NetworkPath  = Join-Path $BaseOutputDir $fileName
+        LocalPath    = Join-Path $BaseLocalOutputDir $fileName
+    }
+}
+
+function Get-WifiDetails {
+    $out = netsh wlan show interfaces | Out-String
+    $result = @{
+        Interface     = ""
+        State         = ""
+        SSID          = ""
+        BSSID         = ""
+        Radio         = ""
+        Channel       = ""
+        SignalPercent = ""
+    }
+
+    foreach ($line in ($out -split "`r?`n")) {
+        if ($line -match "^\s*Name\s*:\s*(.+)$") { $result.Interface = $Matches[1].Trim() }
+        elseif ($line -match "^\s*State\s*:\s*(.+)$") { $result.State = $Matches[1].Trim() }
+        elseif ($line -match "^\s*SSID\s*:\s*(.+)$" -and $line -notmatch "BSSID") { $result.SSID = $Matches[1].Trim() }
+        elseif ($line -match "^\s*BSSID(?:\s+\d+)?\s*:\s*(.+)$") { $result.BSSID = $Matches[1].Trim() }
+        elseif ($line -match "^\s*Radio type\s*:\s*(.+)$") { $result.Radio = $Matches[1].Trim() }
+        elseif ($line -match "^\s*Channel\s*:\s*(.+)$") { $result.Channel = $Matches[1].Trim() }
+        elseif ($line -match "^\s*Signal\s*:\s*(\d+)%") { $result.SignalPercent = [int]$Matches[1] }
+    }
+
+    # BSSID must come from explicit BSSID lines only; do not infer from first MAC in output.
+    if ([string]::IsNullOrWhiteSpace($result.BSSID)) {
+        foreach ($line in ($out -split "`r?`n")) {
+            if ($line -match '(?im)\bBSSID(?:\s+\d+)?\s*:\s*([0-9A-F]{2}(?:[-:][0-9A-F]{2}){5})\b') {
+                $result.BSSID = $Matches[1].Trim()
+                break
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($result.Radio)) {
+        $radioMatch = [regex]::Match($out, '(?im)\b802\.11[a-z0-9]+\b')
+        if ($radioMatch.Success) { $result.Radio = $radioMatch.Value }
+    }
+    if ([string]::IsNullOrWhiteSpace($result.SignalPercent)) {
+        $sigMatch = [regex]::Match($out, '(?im)\b(\d{1,3})\s*%')
+        if ($sigMatch.Success) { $result.SignalPercent = [int]$sigMatch.Groups[1].Value }
+    }
+    if ([string]::IsNullOrWhiteSpace($result.Channel)) {
+        $channelLine = $out -split "`r?`n" | Where-Object { $_ -match '(?i)channel' } | Select-Object -First 1
+        if ($channelLine -and $channelLine -match '(\d{1,3})') { $result.Channel = $Matches[1] }
+    }
+
+    # Adapter/profile fallback for localized netsh output.
+    try {
+        $wifiAdapter = $null
+        if (-not [string]::IsNullOrWhiteSpace($result.Interface)) {
+            $wifiAdapter = Get-NetAdapter -Name $result.Interface -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+        if (-not $wifiAdapter) {
+            $wifiAdapter = Get-NetAdapter | Where-Object {
+                $_.Status -eq "Up" -and (
+                    $_.Name -match 'Wi-?Fi|WLAN' -or
+                    $_.InterfaceDescription -match 'Wi-?Fi|WLAN|Wireless|802\.11' -or
+                    "$($_.NdisPhysicalMedium)" -match '802\.11|Wireless'
+                )
+            } | Select-Object -First 1
+        }
+
+        if ($wifiAdapter) {
+            if ([string]::IsNullOrWhiteSpace($result.Interface)) { $result.Interface = $wifiAdapter.Name }
+            if ([string]::IsNullOrWhiteSpace($result.State)) {
+                $result.State = if ($wifiAdapter.Status -eq "Up") { "connected" } else { "$($wifiAdapter.Status)".ToLowerInvariant() }
+            }
+        }
+    } catch {}
+
+    if ([string]::IsNullOrWhiteSpace($result.State) -and -not [string]::IsNullOrWhiteSpace($result.SSID)) {
+        $result.State = "connected"
+    }
+
+    return $result
+}
+
+function Get-DefaultGatewayForWifi([string]$WifiInterfaceName) {
+    try {
+        $wifiIf = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($WifiInterfaceName)) {
+            $wifiIf = Get-NetAdapter -Name $WifiInterfaceName -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+        }
+
+        if (-not $wifiIf) {
+            $wifiIf = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -match "Wi-?Fi|WLAN" } | Select-Object -First 1
+        }
+
+        if (-not $wifiIf) {
+            $wifiIf = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1 | Select-Object -ExpandProperty NetAdapter -ErrorAction SilentlyContinue
+        }
+
+        if (-not $wifiIf) { return "" }
+
+        $gw = Get-NetIPConfiguration -InterfaceIndex $wifiIf.ifIndex |
+            Select-Object -ExpandProperty IPv4DefaultGateway -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty NextHop -ErrorAction SilentlyContinue
+
+        return $gw
+    } catch {
+        return ""
+    }
+}
+
+function Get-PingMs([string]$TargetHost) {
+    if ([string]::IsNullOrWhiteSpace($TargetHost)) { return "" }
+    try {
+        $pingOutput = & ping.exe -n 1 -w 1000 $TargetHost 2>$null
+        if (-not $pingOutput) { return "" }
+
+        $joinedOutput = $pingOutput -join "`n"
+        if ($joinedOutput -match "time[=<]\s*(\d+)\s*ms") { return [int]$Matches[1] }
+        if ($joinedOutput -match "Average = (\d+)ms") { return [int]$Matches[1] }
+        return ""
+    } catch {
+        return ""
+    }
+}
+
+function Get-LoggedOnUser {
+    try {
+        $quserOutput = & quser 2>$null
+        if ($quserOutput) {
+            foreach ($line in $quserOutput) {
+                $trimmed = ([string]$line).Trim()
+                if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+                if ($trimmed -match '^(?i)USERNAME\s+') { continue }
+
+                $normalized = $trimmed.TrimStart(">").Trim()
+                if ([string]::IsNullOrWhiteSpace($normalized)) { continue }
+
+                $tokens = $normalized -split '\s+'
+                if ($tokens.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($tokens[0])) {
+                    return $tokens[0]
+                }
+            }
+        }
+    } catch {}
+
+    try {
+        $loggedOnUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        if ([string]::IsNullOrWhiteSpace($loggedOnUser)) { return "" }
+        return $loggedOnUser
+    } catch {
+        return ""
+    }
+}
+
+function Get-LocalSnapshot([string]$InternetTarget, [string]$InternalTarget1, [string]$InternalTarget2) {
+    $wifi = Get-WifiDetails
+    $gateway = Get-DefaultGatewayForWifi -WifiInterfaceName $wifi.Interface
+    $gwPing = Get-PingMs $gateway
+    $internetPing = Get-PingMs $InternetTarget
+    $internalPing1 = Get-PingMs $InternalTarget1
+    $internalPing2 = Get-PingMs $InternalTarget2
+
+    $signalDbm = ""
+    if ($wifi.SignalPercent -ne "") {
+        $signalDbm = [math]::Round(($wifi.SignalPercent / 2) - 100, 0)
+    }
+
+    return [PSCustomObject]@{
+        Computer       = $env:COMPUTERNAME
+        Interface      = $wifi.Interface
+        State          = $wifi.State
+        SSID           = $wifi.SSID
+        BSSID          = $wifi.BSSID
+        Radio          = $wifi.Radio
+        Channel        = $wifi.Channel
+        SignalPercent  = $wifi.SignalPercent
+        SignalDbm      = $signalDbm
+        Gateway        = $gateway
+        GatewayPingMs  = $gwPing
+        InternetPingMs = $internetPing
+        InternalHost1PingMs = $internalPing1
+        InternalHost2PingMs = $internalPing2
+    }
+}
+
+function Get-RemoteSnapshot([string]$TargetComputer, [PSCredential]$RemoteCredential, [string]$InternetTarget, [string]$InternalTarget1, [string]$InternalTarget2) {
+    $scriptBlock = {
+        param([string]$InnerInternetTarget, [string]$InnerInternalTarget1, [string]$InnerInternalTarget2)
+
+        function Get-PingMsFromExe([string]$TargetHost) {
+            if ([string]::IsNullOrWhiteSpace($TargetHost)) { return "" }
+            try {
+                $pingOutput = & ping.exe -n 1 -w 1000 $TargetHost 2>$null
+                if (-not $pingOutput) { return "" }
+
+                $joinedOutput = $pingOutput -join "`n"
+                if ($joinedOutput -match "time[=<]\s*(\d+)\s*ms") { return [int]$Matches[1] }
+                if ($joinedOutput -match "Average = (\d+)ms") { return [int]$Matches[1] }
+                return ""
+            } catch {
+                return ""
+            }
+        }
+
+        $out = netsh wlan show interfaces | Out-String
+        $wifi = @{
+            Interface     = ""
+            State         = ""
+            SSID          = ""
+            BSSID         = ""
+            Radio         = ""
+            Channel       = ""
+            SignalPercent = ""
+        }
+
+        foreach ($line in ($out -split "`r?`n")) {
+            if ($line -match "^\s*Name\s*:\s*(.+)$") { $wifi.Interface = $Matches[1].Trim() }
+            elseif ($line -match "^\s*State\s*:\s*(.+)$") { $wifi.State = $Matches[1].Trim() }
+            elseif ($line -match "^\s*SSID\s*:\s*(.+)$" -and $line -notmatch "BSSID") { $wifi.SSID = $Matches[1].Trim() }
+            elseif ($line -match "^\s*BSSID(?:\s+\d+)?\s*:\s*(.+)$") { $wifi.BSSID = $Matches[1].Trim() }
+            elseif ($line -match "^\s*Radio type\s*:\s*(.+)$") { $wifi.Radio = $Matches[1].Trim() }
+            elseif ($line -match "^\s*Channel\s*:\s*(.+)$") { $wifi.Channel = $Matches[1].Trim() }
+            elseif ($line -match "^\s*Signal\s*:\s*(\d+)%") { $wifi.SignalPercent = [int]$Matches[1] }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($wifi.BSSID)) {
+            foreach ($line in ($out -split "`r?`n")) {
+                if ($line -match '(?im)\bBSSID(?:\s+\d+)?\s*:\s*([0-9A-F]{2}(?:[-:][0-9A-F]{2}){5})\b') {
+                    $wifi.BSSID = $Matches[1].Trim()
+                    break
+                }
+            }
+        }
+
+        $gateway = ""
+        try {
+            $wifiIf = $null
+            if (-not [string]::IsNullOrWhiteSpace($wifi.Interface)) {
+                $wifiIf = Get-NetAdapter -Name $wifi.Interface -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+            }
+            if (-not $wifiIf) {
+                $wifiIf = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -match "Wi-?Fi|WLAN" } | Select-Object -First 1
+            }
+            if (-not $wifiIf) {
+                $wifiIf = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1 | Select-Object -ExpandProperty NetAdapter -ErrorAction SilentlyContinue
+            }
+            if ($wifiIf) {
+                $gateway = Get-NetIPConfiguration -InterfaceIndex $wifiIf.ifIndex |
+                    Select-Object -ExpandProperty IPv4DefaultGateway -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty NextHop -ErrorAction SilentlyContinue
+            }
+        } catch {}
+
+        $gwPing = ""
+        if (-not [string]::IsNullOrWhiteSpace($gateway)) {
+            $gwPing = Get-PingMsFromExe $gateway
+        }
+
+        $internetPing = Get-PingMsFromExe $InnerInternetTarget
+        $internalPing1 = Get-PingMsFromExe $InnerInternalTarget1
+        $internalPing2 = Get-PingMsFromExe $InnerInternalTarget2
+
+        $signalDbm = ""
+        if ($wifi.SignalPercent -ne "") {
+            $signalDbm = [math]::Round(($wifi.SignalPercent / 2) - 100, 0)
+        }
+
+        [PSCustomObject]@{
+            Computer       = $env:COMPUTERNAME
+            Interface      = $wifi.Interface
+            State          = $wifi.State
+            SSID           = $wifi.SSID
+            BSSID          = $wifi.BSSID
+            Radio          = $wifi.Radio
+            Channel        = $wifi.Channel
+            SignalPercent  = $wifi.SignalPercent
+            SignalDbm      = $signalDbm
+            Gateway        = $gateway
+            GatewayPingMs  = $gwPing
+            InternetPingMs = $internetPing
+            InternalHost1PingMs = $internalPing1
+            InternalHost2PingMs = $internalPing2
+        }
+    }
+
+    $invokeParams = @{
+        ComputerName = $TargetComputer
+        ScriptBlock  = $scriptBlock
+        ArgumentList = @($InternetTarget, $InternalTarget1, $InternalTarget2)
+        ErrorAction  = "Stop"
+    }
+    if ($RemoteCredential) {
+        $invokeParams.Credential = $RemoteCredential
+    }
+
+    return Invoke-Command @invokeParams
+}
+
+New-Item -ItemType Directory -Path $LocalOutputDir -Force | Out-Null
+
+$safeComputerName = Get-SafeComputerName -InputComputerName $ComputerName
+$lockFilePath = Join-Path $LocalOutputDir "wifi-telemetry_${safeComputerName}.lock"
+Stop-PreviousInstanceIfNeeded -LockFilePath $lockFilePath
+Set-Content -Path $lockFilePath -Value $PID -NoNewline -Encoding ascii
+$currentPaths = Get-CsvPathsForHour -BaseOutputDir $OutputDir -BaseLocalOutputDir $LocalOutputDir -SafeComputerName $safeComputerName -Now (Get-Date)
+
+try {
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+} catch {
+    # Network path can be unavailable; local logging still proceeds.
+}
+Ensure-LocationServicesEnabled
+[void](Try-EnsureNetworkCsvFile -FilePath $currentPaths.NetworkPath)
+Ensure-CsvFile -FilePath $currentPaths.LocalPath
+$lastSyncAt = (Get-Date).AddMinutes(-$SyncIntervalMinutes)
+$lastKnownLoggedOnUser = ""
+
+Write-Host "Network CSV: $($currentPaths.NetworkPath)"
+Write-Host "Local CSV: $($currentPaths.LocalPath)"
+Write-Host "Press Ctrl+C to stop."
+
+try {
+    while ($true) {
+        $now = Get-Date
+        $nowString = $now.ToString("yyyy-MM-dd HH:mm:ss")
+        $detectedLoggedOnUser = Get-LoggedOnUser
+        $isLocalTarget = $ComputerName -eq "." -or $ComputerName -eq "localhost" -or $ComputerName -ieq $env:COMPUTERNAME
+
+        $expectedHourStamp = $now.ToString("yyyyMMdd_HH")
+        if ($currentPaths.HourStamp -ne $expectedHourStamp) {
+            $currentPaths = Get-CsvPathsForHour -BaseOutputDir $OutputDir -BaseLocalOutputDir $LocalOutputDir -SafeComputerName $safeComputerName -Now $now
+            [void](Try-EnsureNetworkCsvFile -FilePath $currentPaths.NetworkPath)
+            Ensure-CsvFile -FilePath $currentPaths.LocalPath
+            Write-Host "Rotated to new hourly CSV: $($currentPaths.NetworkPath)"
+        }
+
+        $hasDetectedUser = (-not [string]::IsNullOrWhiteSpace($detectedLoggedOnUser)) -and
+            (-not $detectedLoggedOnUser.Trim().Equals("Unknown", [System.StringComparison]::OrdinalIgnoreCase)) -and
+            (-not $detectedLoggedOnUser.Trim().Equals("NoUserLoggedOn", [System.StringComparison]::OrdinalIgnoreCase))
+        if ($hasDetectedUser) {
+            $lastKnownLoggedOnUser = $detectedLoggedOnUser
+        }
+        $loggedOnUser = if ($hasDetectedUser) { $detectedLoggedOnUser } elseif (-not [string]::IsNullOrWhiteSpace($lastKnownLoggedOnUser)) { $lastKnownLoggedOnUser } else { "NoUserLoggedOn" }
+
+        try {
+            if ($isLocalTarget) {
+                $sample = Get-LocalSnapshot -InternetTarget $InternetHost -InternalTarget1 $InternalHost1 -InternalTarget2 $InternalHost2
+            } else {
+                $sample = Get-RemoteSnapshot -TargetComputer $ComputerName -RemoteCredential $Credential -InternetTarget $InternetHost -InternalTarget1 $InternalHost1 -InternalTarget2 $InternalHost2
+            }
+        } catch {
+            $sample = [PSCustomObject]@{
+                Computer       = $ComputerName
+                Interface      = ""
+                State          = ""
+                SSID           = ""
+                BSSID          = ""
+                Radio          = ""
+                Channel        = ""
+                SignalPercent  = ""
+                SignalDbm      = ""
+                Gateway        = ""
+                GatewayPingMs  = ""
+                InternetPingMs = ""
+                InternalHost1PingMs = ""
+                InternalHost2PingMs = ""
+            }
+        }
+
+        $row = @(
+            $nowString
+            $sample.Computer
+            $loggedOnUser
+            $sample.Interface
+            $sample.State
+            $sample.SSID
+            $sample.BSSID
+            $sample.Radio
+            $sample.Channel
+            $sample.SignalPercent
+            $sample.SignalDbm
+            $sample.Gateway
+            $sample.GatewayPingMs
+            $InternetHost
+            $sample.InternetPingMs
+            $InternalHost1
+            $sample.InternalHost1PingMs
+            $InternalHost2
+            $sample.InternalHost2PingMs
+        ) -join ","
+
+        Add-Content -Path $currentPaths.LocalPath -Value $row
+        if (-not (Test-Path $currentPaths.NetworkPath)) {
+            [void](Try-EnsureNetworkCsvFile -FilePath $currentPaths.NetworkPath)
+        }
+        [void](Try-AppendNetworkRow -FilePath $currentPaths.NetworkPath -Row $row)
+
+        if (((Get-Date) - $lastSyncAt).TotalMinutes -ge $SyncIntervalMinutes) {
+            if (Test-WlanAccessBlocked) {
+                Ensure-LocationServicesEnabled
+            }
+            $currentHourStamp = $now.ToString("yyyyMMdd_HH")
+            $syncStartHourStamp = $now.AddHours(-1 * [math]::Max(1, $SyncBacklogHours)).ToString("yyyyMMdd_HH")
+            Sync-LocalCsvToNetwork -BaseLocalDir $LocalOutputDir -BaseNetworkDir $OutputDir -CurrentHourStamp $currentHourStamp -SyncStartHourStamp $syncStartHourStamp
+            $lastSyncAt = Get-Date
+        }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+}
+finally {
+    try {
+        $currentLockPid = Read-LockPid -LockFilePath $lockFilePath
+        if ($currentLockPid -eq $PID -and (Test-Path $lockFilePath)) {
+            Remove-Item -Path $lockFilePath -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
